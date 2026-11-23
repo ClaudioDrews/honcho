@@ -58,7 +58,7 @@ def main():
     changed_files = [Path(f) for f in sys.argv[1:]]
 
     # Paths
-    repo_root = Path(__file__).parent.parent
+    repo_root = Path(__file__).resolve().parent.parent
     migrations_dir = repo_root / "migrations" / "versions"
     tests_dir = repo_root / "tests" / "alembic" / "revisions"
     alembic_tests_dir = repo_root / "tests" / "alembic"
