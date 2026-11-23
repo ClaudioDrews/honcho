@@ -20,8 +20,9 @@ from typing import Any, Literal, TypeVar, overload
 
 from pydantic import BaseModel
 
-from src.config import ModelConfig, ModelTransport
+from src.config import ModelConfig, ModelTransport, settings
 from src.telemetry.tenant import current_tenant_id
+from src.utils.interpretation import fingerprint_prompt, reported_model
 
 from .backend import CompletionResult as BackendCompletionResult
 from .backend import StreamChunk as BackendStreamChunk
@@ -554,6 +555,25 @@ async def honcho_llm_call_inner(
         response = completion_result_to_response(
             backend_result, codec.parse(backend_result, origin)
         )
+        response.model = model
+        # Model selected for the successful attempt, and separate provider report.
+        if settings.CONCLUSION_LEDGER.ENABLED:
+            response.ledger_call = {
+                "selected_model": model,
+                "reported_model": reported_model(backend_result.raw_response),
+                "prompt_sha256": fingerprint_prompt(
+                    wire_messages,
+                    tools,
+                    response_model.model_json_schema() if response_model else None,
+                    tool_choice,
+                ),
+                "transport": str(provider),
+                "attempt": plan.attempt if plan else 1,
+                "fallback": plan.is_fallback if plan else False,
+                "iteration": telemetry.iteration if telemetry else None,
+                "span_id": telemetry.span_id if telemetry else None,
+            }
+        response.transport = str(provider)
         if validate_response is not None:
             validate_response(response)
         return response

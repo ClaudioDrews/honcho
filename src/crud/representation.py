@@ -6,12 +6,13 @@ import time
 from contextlib import suppress
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import ColumnElement, select
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from src import crud, exceptions, models, schemas
 from src.config import settings
+from src.crud import conclusion_ledger
 from src.crud.lifecycle import live_document_row
 from src.dependencies import tracked_db
 from src.dreamer.dream_scheduler import check_and_schedule_dream
@@ -66,6 +67,13 @@ def _normalized_observation(
             }
         )
     return obs.model_copy(update={"content": text})
+
+
+def _ledger_current() -> list[ColumnElement[bool]]:
+    """The conclusion ledger's retrieval filter: the working representation
+    holds only conclusions in force."""
+    clause = conclusion_ledger.retrieval_clause()
+    return [clause] if clause is not None else []
 
 
 class RepresentationManager:
@@ -212,6 +220,7 @@ class RepresentationManager:
 
             metadata: schemas.DocumentMetadata = schemas.DocumentMetadata(
                 message_ids=message_ids,
+                temporal=obs.temporal,
                 premises=obs_premises,
                 message_created_at=format_datetime_utc(message_created_at),
             )
@@ -508,6 +517,7 @@ class RepresentationManager:
                 models.Document.observer == self.observer,
                 models.Document.observed == self.observed,
                 live_document_row(self.workspace_name),
+                *_ledger_current(),
                 *(
                     [models.Document.id.notin_(excluded_document_ids)]
                     if excluded_document_ids
@@ -545,6 +555,7 @@ class RepresentationManager:
                 models.Document.observer == self.observer,
                 models.Document.observed == self.observed,
                 live_document_row(self.workspace_name),
+                *_ledger_current(),
                 *(
                     [
                         models.Document.session_name.in_(session_allowlist),

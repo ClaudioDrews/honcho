@@ -48,6 +48,11 @@ from src.utils.agent_tools import (
     create_tool_executor,
     search_memory,
 )
+from src.utils.derivation import (
+    DerivationRecord,
+    derivation_scope,
+    prompt_scaffold_fingerprint,
+)
 from src.utils.evidence import EvidenceAccumulator
 from src.utils.formatting import format_new_turn_with_timestamp
 from src.utils.memory_brief import load_memory_counts, memory_layout_section
@@ -507,6 +512,33 @@ class DialecticAgent:
             "Use these as primary context. You may still use tools to find additional information if needed."
         )
 
+    def _derivation_record(self) -> DerivationRecord:
+        """Conclusion ledger record for conclusions this agent's tools write.
+
+        The pair loadout has no write tool today; this keeps any future one
+        recorded like the deriver's and the dreamer's.
+        """
+        model_config = _get_dialectic_level_model_config(self.reasoning_level)
+        return DerivationRecord(
+            producer=f"dialectic.{self.reasoning_level}",
+            model=model_config.model,
+            fallback_model=(
+                model_config.fallback.model if model_config.fallback else None
+            ),
+            prompt_version=prompt_scaffold_fingerprint(
+                prompts.agent_system_prompt,
+                ",".join(
+                    sorted(
+                        name
+                        for tool in self._select_tools()
+                        if isinstance((name := tool.get("name")), str)
+                    )
+                ),
+                self.instructions.custom_instructions,
+            ),
+            run_id=self._run_id,
+        )
+
     def _telemetry_context(self, track_name: str | None = None) -> LLMTelemetryContext:
         """Build the LLMTelemetryContext shared by answer() and answer_stream().
 
@@ -672,28 +704,29 @@ class DialecticAgent:
             # cast: `type[BaseModel] | None` matches neither the parsed nor the
             # plain-text overload statically, so pyright resolves the stream
             # overload — but without stream=True the call is non-streaming.
-            response = cast(  # pyright: ignore[reportInvalidCast]
-                HonchoLLMCallResponse[Any],
-                await honcho_llm_call(
-                    model_config=_get_dialectic_level_model_config(
-                        self.reasoning_level
+            with derivation_scope(self._derivation_record()):
+                response = cast(  # pyright: ignore[reportInvalidCast]
+                    HonchoLLMCallResponse[Any],
+                    await honcho_llm_call(
+                        model_config=_get_dialectic_level_model_config(
+                            self.reasoning_level
+                        ),
+                        prompt="",  # Ignored since we pass messages
+                        max_tokens=max_tokens,
+                        tools=tools,
+                        tool_choice=self._tool_choice(level_settings),
+                        force_tools_until=self._force_tools_until(),
+                        tool_executor=tool_executor,
+                        max_tool_iterations=self._max_tool_iterations(level_settings),
+                        budget_line=self._budget_line(level_settings),
+                        messages=self.messages,
+                        max_input_tokens=settings.DIALECTIC.MAX_INPUT_TOKENS,
+                        trace_name="dialectic_chat",
+                        telemetry=telemetry,
+                        response_model=response_model,
+                        run=run,
                     ),
-                    prompt="",  # Ignored since we pass messages
-                    max_tokens=max_tokens,
-                    tools=tools,
-                    tool_choice=self._tool_choice(level_settings),
-                    force_tools_until=self._force_tools_until(),
-                    tool_executor=tool_executor,
-                    max_tool_iterations=self._max_tool_iterations(level_settings),
-                    budget_line=self._budget_line(level_settings),
-                    messages=self.messages,
-                    max_input_tokens=settings.DIALECTIC.MAX_INPUT_TOKENS,
-                    trace_name="dialectic_chat",
-                    telemetry=telemetry,
-                    response_model=response_model,
-                    run=run,
-                ),
-            )
+                )
         except BaseException as exc:
             if run is not None:
                 run.end(is_error=True)
@@ -782,30 +815,31 @@ class DialecticAgent:
         accumulated_content: list[str] = []
         is_error = False
         try:
-            response = cast(
-                StreamingResponseWithMetadata,
-                await honcho_llm_call(
-                    model_config=_get_dialectic_level_model_config(
-                        self.reasoning_level
+            with derivation_scope(self._derivation_record()):
+                response = cast(
+                    StreamingResponseWithMetadata,
+                    await honcho_llm_call(
+                        model_config=_get_dialectic_level_model_config(
+                            self.reasoning_level
+                        ),
+                        prompt="",  # Ignored since we pass messages
+                        max_tokens=max_tokens,
+                        stream=True,
+                        stream_final_only=True,
+                        tools=tools,
+                        tool_choice=self._tool_choice(level_settings),
+                        force_tools_until=self._force_tools_until(),
+                        tool_executor=tool_executor,
+                        max_tool_iterations=self._max_tool_iterations(level_settings),
+                        budget_line=self._budget_line(level_settings),
+                        messages=self.messages,
+                        max_input_tokens=settings.DIALECTIC.MAX_INPUT_TOKENS,
+                        trace_name="dialectic_chat",
+                        telemetry=telemetry,
+                        response_model=response_model,
+                        run=run,
                     ),
-                    prompt="",  # Ignored since we pass messages
-                    max_tokens=max_tokens,
-                    stream=True,
-                    stream_final_only=True,
-                    tools=tools,
-                    tool_choice=self._tool_choice(level_settings),
-                    force_tools_until=self._force_tools_until(),
-                    tool_executor=tool_executor,
-                    max_tool_iterations=self._max_tool_iterations(level_settings),
-                    budget_line=self._budget_line(level_settings),
-                    messages=self.messages,
-                    max_input_tokens=settings.DIALECTIC.MAX_INPUT_TOKENS,
-                    trace_name="dialectic_chat",
-                    telemetry=telemetry,
-                    response_model=response_model,
-                    run=run,
-                ),
-            )
+                )
 
             async for chunk in response:
                 if chunk.content:

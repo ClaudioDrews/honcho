@@ -1607,6 +1607,53 @@ class DreamSettings(HonchoSettings):
         return self
 
 
+class ConclusionLedgerSettings(HonchoSettings):
+    """Permanent, append-only history of how conclusions were interpreted.
+
+    Off by default: with it off nothing is written and behaviour is unchanged.
+    When ENABLED=True, writers record their interpretations transactionally,
+    without changing deduplication, retrieval or LLM schemas by default.
+    Temporal filtering, temporal dedup, contradiction-tool exposure and
+    automatic state transitions require separate, explicit feature flags.
+
+    Deleting a conclusion through the API, its session or its workspace
+    deletes its revisions too: the ledger keeps what the system revised, not
+    what the user asked to forget.
+    """
+
+    model_config = SettingsConfigDict(  # pyright: ignore
+        env_prefix="CONCLUSION_LEDGER_", env_nested_delimiter="__", extra="ignore"
+    )
+
+    ENABLED: bool = False
+    # The ledger is observational by default. Each behavior-changing feature
+    # below requires its own explicit opt-in, independently of ENABLED.
+    TEMPORAL_EXTRACTION_ENABLED: bool = False
+    TEMPORAL_DEDUP_ENABLED: bool = False
+    RETRIEVAL_FILTER_ENABLED: bool = False
+    CONTRADICTION_TOOL_ENABLED: bool = False
+    AUTO_RESOLVE_CONTRADICTIONS: bool = False
+    MARK_SUPERSEDED_HISTORICAL: bool = False
+    # Verbatim matching for explicit conclusions: the conclusion counts as
+    # `declared_verbatim` only when its normalized text is at least this long
+    # and matches an entire message authored by the observee.
+    VERBATIM_MIN_CHARS: Annotated[int, Field(default=12, ge=1, le=1000)] = 12
+    # Deprecated compatibility setting. Fuzzy matches are evidence only.
+    NEAR_VERBATIM_MIN_RATIO: Annotated[float, Field(default=0.9, ge=0.5, le=1.0)] = 0.9
+    # What a contradiction does to the conclusions it cites. `unknown`: all of
+    # them become validity `unknown`. `most_recent`: when exactly one of them
+    # has the latest evidenced valid_from, it stays `applicable` and the others become
+    # `incompatible`, without changing world-time bounds; on a tie or a missing valid_from
+    # all become `unknown`.
+    CONTRADICTION_RESOLUTION: Literal["unknown", "most_recent"] = "unknown"
+    # Applied only if RETRIEVAL_FILTER_ENABLED=True. Contested claims remain
+    # visible by default, because hiding both sides of a contradiction loses
+    # the evidence needed to resolve it. Readers should label unknown claims.
+    RETRIEVAL_EXCLUDE: list[Literal["historical", "incompatible", "unknown"]] = Field(
+        default_factory=lambda: ["historical", "incompatible"]
+    )
+
+
 class VectorStoreSettings(HonchoSettings):
     """Settings for vector store (pgvector, Turbopuffer, LanceDB, Qdrant, or ChromaDB)."""
 
@@ -1783,6 +1830,9 @@ class AppSettings(HonchoSettings):
     TELEMETRY: TelemetrySettings = Field(default_factory=TelemetrySettings)
     CACHE: CacheSettings = Field(default_factory=CacheSettings)
     DREAM: DreamSettings = Field(default_factory=DreamSettings)
+    CONCLUSION_LEDGER: ConclusionLedgerSettings = Field(
+        default_factory=ConclusionLedgerSettings
+    )
     VECTOR_STORE: VectorStoreSettings = Field(default_factory=VectorStoreSettings)
     TRACE_VIEWER: TraceViewerSettings = Field(default_factory=TraceViewerSettings)
 

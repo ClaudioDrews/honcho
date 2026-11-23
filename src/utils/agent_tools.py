@@ -2,8 +2,9 @@ import asyncio
 import logging
 import weakref
 from collections.abc import Callable, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import UTC, datetime
 from functools import partial
 from typing import Any, cast
 
@@ -34,6 +35,7 @@ from src.utils.formatting import (
     parse_datetime_iso,
     utc_now_iso,
 )
+from src.utils.interpretation import TemporalValidity
 from src.utils.representation import (
     ALLOWLIST_SAFE_LEVELS,
     Representation,
@@ -398,6 +400,33 @@ TOOLS: dict[str, dict[str, Any]] = {
             "required": ["observations"],
         },
     },
+    "create_observations_contradiction": {
+        "name": "create_observations_contradiction",
+        "description": "Flag incompatible claims about the same fact, time and context. Do not use for ordinary changes or corrections; cite two distinct existing conclusion IDs.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "observations": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {"type": "string"},
+                            "source_ids": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "minItems": 2,
+                                "uniqueItems": True,
+                            },
+                        },
+                        "required": ["content", "source_ids"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["observations"],
+        },
+    },
     "update_peer_card": {
         "name": "update_peer_card",
         "description": (
@@ -443,6 +472,11 @@ TOOLS: dict[str, dict[str, Any]] = {
                     "type": "integer",
                     "description": "(Optional) number of results to return (default: 20, max: 40)",
                     "default": 20,
+                },
+                "include_history": {
+                    "type": "boolean",
+                    "description": "(Optional) also return observations that are no longer in force (superseded or contradicted), each labeled with its validity and dates. Use for questions about how something changed over time. Default: false",
+                    "default": False,
                 },
             },
             "required": ["query"],
@@ -723,6 +757,25 @@ WORKSPACE_RECALL_TOOLS: frozenset[str] = frozenset(
     }
 )
 
+
+def with_ledger_temporal_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not (
+        settings.CONCLUSION_LEDGER.ENABLED
+        and settings.CONCLUSION_LEDGER.TEMPORAL_EXTRACTION_ENABLED
+    ):
+        return tools
+    result = deepcopy(tools)
+    for tool in result:
+        if tool["name"] in (
+            "create_observations_deductive",
+            "create_observations_inductive",
+        ):
+            tool["input_schema"]["properties"]["observations"]["items"]["properties"][
+                "temporal"
+            ] = TemporalValidity.model_json_schema()
+    return result
+
+
 # Tools for the deduction specialist (dreamer phase 1)
 # Creates deductive observations from explicit observations, can delete duplicates
 # Includes message access for context and self-directed exploration
@@ -814,7 +867,9 @@ async def _filter_ungrounded_source_ids(
         if obs.level not in _SOURCE_GROUNDED_LEVELS or not obs.source_ids:
             grounded.append(obs)
             continue
-        real_ids = [sid for sid in obs.source_ids if sid in resolved_ids]
+        real_ids = list(
+            dict.fromkeys(sid for sid in obs.source_ids if sid in resolved_ids)
+        )
         dropped = len(obs.source_ids) - len(real_ids)
         # Mirror the per-level minimums enforced by validate_level_fields.
         min_sources = 2 if obs.level == "contradiction" else 1
@@ -975,6 +1030,7 @@ async def create_observations(
         # the document_sources table (via DocumentCreate.source_ids below).
         metadata = schemas.DocumentMetadata(
             message_ids=message_ids,
+            temporal=obs.temporal,
             message_created_at=message_created_at,
             premises=obs.premises if obs.level == "deductive" else None,
             sources=obs.sources
@@ -1496,6 +1552,20 @@ async def _handle_create_observations_inductive(
     )
 
 
+async def _handle_create_observations_contradiction(
+    ctx: ToolContext, tool_input: dict[str, Any]
+) -> "str | ToolResult":
+    if (
+        not settings.CONCLUSION_LEDGER.ENABLED
+        or not settings.CONCLUSION_LEDGER.CONTRADICTION_TOOL_ENABLED
+        or ctx.agent_type != "deduction"
+    ):
+        return "ERROR: contradiction writes require an enabled deduction specialist"
+    return await _handle_create_observations_impl(
+        ctx, tool_input, forced_level="contradiction"
+    )
+
+
 async def _handle_update_peer_card(
     ctx: ToolContext, tool_input: dict[str, Any]
 ) -> "str | ToolResult":
@@ -1694,6 +1764,30 @@ def _record_snippet_evidence(
         _record_message_evidence(ctx, context)
 
 
+def _label_non_current(documents: Sequence[models.Document]) -> None:
+    """Prefix conclusions not in force with their validity and window.
+
+    The documents are detached copies returned by query_documents (db=None),
+    so the label reaches the agent and the evidence without touching the rows.
+    """
+    now = datetime.now(UTC)
+    for doc in documents:
+        status = doc.validity
+        if status == "applicable":
+            if doc.valid_until is not None and doc.valid_until <= now:
+                status = "expired"
+            elif doc.valid_from is not None and doc.valid_from > now:
+                status = "not_yet_valid"
+            else:
+                continue
+        window = ""
+        if doc.valid_from is not None or doc.valid_until is not None:
+            start = doc.valid_from.date().isoformat() if doc.valid_from else "?"
+            end = doc.valid_until.date().isoformat() if doc.valid_until else "?"
+            window = f" {start}..{end}"
+        doc.content = f"[{status}{window}] {doc.content}"
+
+
 async def _handle_search_memory(
     ctx: ToolContext, tool_input: dict[str, Any]
 ) -> "str | ToolResult":
@@ -1702,6 +1796,7 @@ async def _handle_search_memory(
 
     top_k = _bounded_int(tool_input.get("top_k"), 20, hi=40)
     query = tool_input["query"]
+    include_history = tool_input.get("include_history") is True
     try:
         with embedding_call_purpose(
             EmbeddingCallPurpose.SEARCH_MEMORY.value,
@@ -1749,7 +1844,10 @@ async def _handle_search_memory(
             }
             if ctx.session_allowlist is not None
             else None,
+            include_non_current=include_history,
         )
+        if include_history:
+            _label_non_current(documents)
     _record_conclusion_evidence(ctx, documents)
     mem = Representation.from_documents(documents)
     total_count = mem.len()
@@ -2396,6 +2494,7 @@ async def _handle_get_reasoning_chain(
 _TOOL_HANDLERS: dict[str, Callable[[ToolContext, dict[str, Any]], Any]] = {
     "create_observations_deductive": _handle_create_observations_deductive,
     "create_observations_inductive": _handle_create_observations_inductive,
+    "create_observations_contradiction": _handle_create_observations_contradiction,
     "update_peer_card": _handle_update_peer_card,
     "search_memory": _handle_search_memory,
     "get_observation_context": _handle_get_observation_context,

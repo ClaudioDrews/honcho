@@ -31,6 +31,7 @@ from src.schemas.configuration import (
     SessionPeerConfigInput,
     WorkspaceConfiguration,
 )
+from src.utils.interpretation import TemporalClass, TemporalValidity
 from src.utils.sanitization import NulStripped, StorableOnly, strip_nul
 from src.utils.scopes import (
     SCOPE_PEER_PREFIX,
@@ -1174,6 +1175,43 @@ class Conclusion(BaseModel):
         default=1,
         description="Number of times this conclusion has been independently derived.",
     )
+    assertion_basis: str | None = Field(
+        default=None,
+        description=(
+            "What the content rests on, recorded when the conclusion ledger is "
+            "on: 'declared_verbatim' (complete utterance by the observed peer), "
+            "'declared_near_verbatim' (legacy value, no longer generated), "
+            "'llm_reading' (the deriver's reading of what the cited messages "
+            "say), 'llm_inference' (deductive, inductive, contradiction) or "
+            "'api_supplied'. Null for conclusions written with the ledger off."
+        ),
+    )
+    temporal_class: TemporalClass | None = None
+    validity: str = Field(
+        default="applicable",
+        description=(
+            "Standing for the present: 'applicable', 'historical' (superseded), "
+            "'incompatible' (contradicted and resolved against) or 'unknown' "
+            "(contested)."
+        ),
+    )
+    declared_spans: list[dict[str, Any]] | None = Field(
+        default=None,
+        description=(
+            "For explicit conclusions written with the ledger on: the spans of "
+            "the cited messages the conclusion rests on, each with message_id, "
+            "start, end, sha256, match ('verbatim' or 'closest'; legacy near_verbatim) "
+            "and score."
+        ),
+    )
+    valid_from: datetime.datetime | None = Field(
+        default=None,
+        description="When the conclusion became true of the observed peer, as far as the ledger knows.",
+    )
+    valid_until: datetime.datetime | None = Field(
+        default=None,
+        description="Exclusive end of evidence-supported world-time validity; null means unknown/open.",
+    )
     created_at: datetime.datetime
 
     @field_validator("source_ids", mode="before")
@@ -1190,6 +1228,62 @@ class Conclusion(BaseModel):
     model_config = ConfigDict(  # pyright: ignore
         from_attributes=True,
         populate_by_name=True,
+    )
+
+
+class ConclusionRevision(BaseModel):
+    """One entry in a conclusion's permanent history (conclusion ledger)."""
+
+    id: int
+    conclusion_id: str
+    kind: Literal["created", "reinforced", "superseded", "removed", "revalidated"]
+    level: DocumentLevel | None = None
+    content: str | None = None
+    session_name: str | None = Field(default=None, serialization_alias="session_id")
+    assertion_basis: str | None = None
+    validity: str | None = None
+    temporal_class: TemporalClass | None = None
+    candidate: dict[str, Any] | None = None
+    previous_validity: str | None = None
+    superseded_by: str | None = None
+    source_ids: list[str] | None = None
+    source_message_ids: list[str] | None = None
+    declared_spans: list[dict[str, Any]] | None = None
+    valid_from: datetime.datetime | None = None
+    valid_until: datetime.datetime | None = None
+    times_derived: int | None = None
+    derivation: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "producer, model, fallback_model, model_used (the one that "
+            "answered), prompt_version, run_id"
+        ),
+    )
+    reason: str | None = None
+    created_at: datetime.datetime
+
+    model_config = ConfigDict(  # pyright: ignore
+        from_attributes=True,
+        populate_by_name=True,
+    )
+
+
+class ConclusionValiditySet(BaseModel):
+    """Set a conclusion's validity (conclusion ledger)."""
+
+    validity: Literal["applicable", "historical", "incompatible", "unknown"]
+    temporal_class: TemporalClass | None = None
+    reason: str | None = Field(default=None, max_length=1000)
+    valid_from: datetime.datetime | None = Field(
+        default=None,
+        description="Omit to keep the current value; null clears it.",
+    )
+    valid_until: datetime.datetime | None = Field(
+        default=None,
+        description=(
+            "Omit to keep the current value; null clears it. "
+            "Changing status does not imply a change in world time."
+        ),
     )
 
 
@@ -1217,6 +1311,8 @@ class ConclusionQuery(BaseModel):
 
 class ConclusionCreate(BaseModel):
     """Schema for creating a single conclusion."""
+
+    temporal: TemporalValidity | None = None
 
     content: Annotated[str, Field(min_length=1, max_length=65535)]
     observer_id: str = Field(..., description="The peer making the conclusion")

@@ -6,15 +6,16 @@ from enum import Enum
 from logging import getLogger
 from typing import Any, Literal, cast
 
-from sqlalchemy import delete, literal, or_, select, tuple_, union_all, update
+from sqlalchemy import and_, delete, literal, or_, select, tuple_, union_all, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import DBAPIError, IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.sql import Select
+from sqlalchemy.sql import ColumnElement, Select
 from sqlalchemy.sql.functions import func
 
 from src import models, schemas
 from src.config import settings
+from src.crud import conclusion_ledger
 from src.crud.collection import get_or_create_collection, record_explicit_documents
 from src.crud.dream_history import (
     CreatedConclusion,
@@ -35,6 +36,7 @@ from src.exceptions import (
     VectorNamespaceUnresolved,
     VectorStoreError,
 )
+from src.utils.derivation import DerivationRecord, derivation_scope
 from src.utils.filter import apply_filter
 from src.vector_store import (
     VectorRecord,
@@ -185,9 +187,14 @@ async def query_documents_recent(
     observed: str,
     limit: int = 10,
     session_name: str | None = None,
+    include_non_current: bool = False,
 ) -> Sequence[models.Document]:
     """
     Query most recent documents.
+
+    With the conclusion ledger on, validities in
+    CONCLUSION_LEDGER_RETRIEVAL_EXCLUDE are left out unless
+    ``include_non_current`` is set.
 
     Args:
         db: Database session
@@ -210,6 +217,11 @@ async def query_documents_recent(
 
     if session_name is not None:
         stmt = stmt.where(models.Document.session_name == session_name)
+    current = conclusion_ledger.retrieval_clause(
+        include_non_current=include_non_current
+    )
+    if current is not None:
+        stmt = stmt.where(current)
 
     stmt = stmt.order_by(models.Document.created_at.desc()).limit(limit)
 
@@ -322,9 +334,12 @@ async def query_documents_most_derived(
     observer: str,
     observed: str,
     limit: int = 10,
+    include_non_current: bool = False,
 ) -> Sequence[models.Document]:
     """
     Query documents sorted by times_derived (most reinforced first).
+
+    Leaves out ledger-excluded validities unless ``include_non_current``.
 
     Args:
         db: Database session
@@ -345,6 +360,7 @@ async def query_documents_most_derived(
             models.Document.observer == observer,
             models.Document.observed == observed,
             live_document_row(workspace_name),
+            *_current_filters(include_non_current),
         )
         .order_by(
             models.Document.times_derived.desc(),
@@ -360,10 +376,57 @@ async def query_documents_most_derived(
     return result.scalars().all()
 
 
+def _current_filters(include_non_current: bool) -> list[ColumnElement[bool]]:
+    """Opt-in current-memory filtering; not used to resolve duplicates."""
+    clause = conclusion_ledger.retrieval_clause(include_non_current=include_non_current)
+    return [clause] if clause is not None else []
+
+
+def _dedup_current_filters() -> list[ColumnElement[bool]]:
+    """Opt-in temporal dedup policy, independent of retrieval filtering."""
+    clause = conclusion_ledger.retrieval_clause(for_dedup=True)
+    return [clause] if clause is not None else []
+
+
 def _uses_pgvector() -> bool:
     """Check whether queries should go through pgvector (DB-only) path."""
     return (
         settings.VECTOR_STORE.TYPE == "pgvector" or not settings.VECTOR_STORE.MIGRATED
+    )
+
+
+def _temporal_dedup_key(doc: schemas.DocumentCreate) -> tuple[Any, Any, Any] | None:
+    """The temporal key a duplicate must share, or None when it does not apply.
+
+    Mirrors ``_ledger_dedup_suffix``: with the ledger off, or temporal dedup
+    off, the temporal key is not part of what makes two documents the same
+    claim, and must not narrow the candidate search either.
+    """
+    if not (
+        conclusion_ledger.ledger_enabled()
+        and settings.CONCLUSION_LEDGER.TEMPORAL_DEDUP_ENABLED
+    ):
+        return None
+    return conclusion_ledger.temporal_key(doc)
+
+
+def _temporal_key_clause(
+    key: tuple[Any, Any, Any],
+) -> ColumnElement[bool]:
+    """SQL mirror of the temporal key comparison, null-safe on every part.
+
+    ``IS NOT DISTINCT FROM`` is the null-safe equality: two open-ended
+    validity windows are the same key, and a null bound must not silently
+    drop a candidate. ``temporal_class`` is compared coalesced, because an
+    unset class reads as ``unknown`` on both sides of the comparison.
+    """
+    temporal_class, valid_from, valid_until = key
+    return and_(
+        func.coalesce(models.Document.temporal_class, "unknown").is_not_distinct_from(
+            temporal_class
+        ),
+        models.Document.valid_from.is_not_distinct_from(valid_from),
+        models.Document.valid_until.is_not_distinct_from(valid_until),
     )
 
 
@@ -373,10 +436,30 @@ _SEMANTIC_DUP_TOP_K = 1
 _SEMANTIC_CANDIDATE_CONCURRENCY = 8
 
 
+def _ledger_dedup_suffix(
+    doc: models.Document | schemas.DocumentCreate,
+) -> tuple[Any, ...]:
+    if not (
+        conclusion_ledger.ledger_enabled()
+        and settings.CONCLUSION_LEDGER.TEMPORAL_DEDUP_ENABLED
+    ):
+        return ()
+    sources = (
+        tuple(sorted(set(doc.source_ids or []))) if doc.level == "contradiction" else ()
+    )
+    return (*conclusion_ledger.temporal_key(doc), sources)
+
+
 def _semantic_dup_filters(doc: schemas.DocumentCreate) -> dict[str, Any] | None:
     """Merge scope for semantic dedup: never across levels, never across
     sessions for explicit documents. None when the document has no valid
     merge partner (session-less explicit)."""
+    if (
+        conclusion_ledger.ledger_enabled()
+        and settings.CONCLUSION_LEDGER.TEMPORAL_DEDUP_ENABLED
+        and doc.level == "contradiction"
+    ):
+        return None
     filters: dict[str, Any] = {"level": doc.level}
     if doc.level == "explicit":
         if doc.session_name is None:
@@ -457,8 +540,15 @@ async def fetch_documents_by_ids(
     observed: str,
     document_ids: list[str],
     filters: dict[str, Any] | None = None,
+    *,
+    include_non_current: bool = True,
+    for_dedup: bool = False,
 ) -> list[models.Document]:
-    """Fetch documents by IDs, preserving input order. DB-only operation."""
+    """Fetch documents by IDs, preserving input order. DB-only operation.
+
+    Semantic search passes ``include_non_current=False`` so ledger-excluded
+    validities are dropped from external-store hits; direct fetches keep them.
+    """
     if not document_ids:
         return []
 
@@ -469,6 +559,13 @@ async def fetch_documents_by_ids(
         .where(models.Document.observed == observed)
         .where(live_document_row(workspace_name))
         .where(models.Document.id.in_(document_ids))
+        .where(
+            *(
+                _dedup_current_filters()
+                if for_dedup
+                else _current_filters(include_non_current)
+            )
+        )
     )
     stmt = apply_filter(stmt, models.Document, filters)
 
@@ -487,8 +584,18 @@ async def _query_documents_pgvector(
     filters: dict[str, Any] | None,
     max_distance: float | None,
     top_k: int,
+    include_non_current: bool = False,
+    *,
+    for_dedup: bool = False,
+    temporal_key: tuple[Any, Any, Any] | None = None,
 ) -> list[models.Document]:
-    """pgvector similarity search — pure DB operation."""
+    """pgvector similarity search; opt-in dedup filters run before LIMIT.
+
+    ``temporal_key`` narrows the candidate set to the documents that share
+    the caller's temporal key. It is applied *before* the LIMIT: the nearest
+    neighbour overall may be a different claim, and limiting to it first
+    would hide the nearest neighbour that is actually the same claim.
+    """
     stmt = (
         select(models.Document)
         .where(models.Document.workspace_name == workspace_name)
@@ -496,12 +603,22 @@ async def _query_documents_pgvector(
         .where(models.Document.observed == observed)
         .where(models.Document.embedding.isnot(None))
         .where(live_document_row(workspace_name, peer_pair=(observer, observed)))
+        .where(
+            *(
+                _dedup_current_filters()
+                if for_dedup
+                else _current_filters(include_non_current)
+            )
+        )
     )
 
     if max_distance is not None:
         stmt = stmt.where(
             models.Document.embedding.cosine_distance(embedding) <= max_distance
         )
+
+    if temporal_key is not None:
+        stmt = stmt.where(_temporal_key_clause(temporal_key))
 
     stmt = apply_filter(stmt, models.Document, filters)
     stmt = stmt.order_by(models.Document.embedding.cosine_distance(embedding)).limit(
@@ -523,9 +640,17 @@ async def query_documents(
     max_distance: float | None = None,
     top_k: int = 5,
     embedding: list[float] | None = None,
+    include_non_current: bool = False,
+    for_dedup: bool = False,
+    temporal_key: tuple[Any, Any, Any] | None = None,
 ) -> Sequence[models.Document]:
     """
     Query documents using semantic similarity.
+
+    With the conclusion ledger on, validities in
+    CONCLUSION_LEDGER_RETRIEVAL_EXCLUDE are left out unless
+    ``include_non_current`` is set. With an external vector store they are
+    dropped after the store returns its top_k, so fewer may come back.
 
     When *db* is provided the caller owns the session lifetime.  When *db* is
     ``None`` the function opens (and closes) its own short-lived session so that
@@ -570,6 +695,9 @@ async def query_documents(
                 filters,
                 max_distance,
                 top_k,
+                include_non_current,
+                for_dedup=for_dedup,
+                temporal_key=temporal_key,
             )
         async with tracked_db("query_documents.pgvector", read_only=True) as managed_db:
             docs = await _query_documents_pgvector(
@@ -581,6 +709,9 @@ async def query_documents(
                 filters,
                 max_distance,
                 top_k,
+                include_non_current,
+                for_dedup=for_dedup,
+                temporal_key=temporal_key,
             )
             for doc in docs:
                 managed_db.expunge(doc)
@@ -608,6 +739,8 @@ async def query_documents(
             observed=observed,
             document_ids=document_ids,
             filters=filters,
+            include_non_current=include_non_current,
+            for_dedup=for_dedup,
         )
     async with tracked_db("query_documents.fetch", read_only=True) as managed_db:
         docs = await fetch_documents_by_ids(
@@ -617,6 +750,8 @@ async def query_documents(
             observed=observed,
             document_ids=document_ids,
             filters=filters,
+            include_non_current=include_non_current,
+            for_dedup=for_dedup,
         )
         for doc in docs:
             managed_db.expunge(doc)
@@ -723,6 +858,8 @@ async def create_documents(
         duplicates and failures), the dedup counts, and the vector sync to run
         after the caller commits.
     """
+    if conclusion_ledger.ledger_enabled():
+        documents = [doc.model_copy(deep=True) for doc in documents]
     honcho_documents: list[models.Document] = []
     accepted_documents: list[schemas.DocumentCreate] = []
     # (document_model, embedding) pairs for the vector sync after the caller commits
@@ -801,8 +938,15 @@ async def create_documents(
     # batch, scoped to (workspace, observer, observed). The SQL normalization must
     # mirror _normalize_content. Matching is further scoped per-document by
     # level (always) and session (for explicit documents) via _dedup_key.
+    snapshots = await conclusion_ledger.snapshot_candidates(
+        db, workspace_name, observed, documents
+    )
+    candidate_targets: dict[int, models.Document] = {}
+    collapsed: dict[int, int] = {}
+    outcomes: dict[int, str] = {}
+    created_sources: dict[int, int] = {}
     batch_normalized: set[str] = {_normalize_content(d.content) for d in documents}
-    existing_by_key: dict[tuple[str, str, str | None], models.Document] = {}
+    existing_by_key: dict[tuple[Any, ...], models.Document] = {}
     if batch_normalized:
         # The `normalized_content_sql.in_(...)` filter below narrows to the
         # (workspace, observer, observed) partition via the single-column indexes,
@@ -827,6 +971,7 @@ async def create_documents(
                 models.Document.observed == observed,
                 models.Document.deleted_at.is_(None),
                 normalized_content_sql.in_(batch_normalized),
+                *_dedup_current_filters(),
             )
         )
         for existing_doc in existing_result.scalars():
@@ -837,19 +982,18 @@ async def create_documents(
                     existing_doc.content,
                     existing_doc.level,
                     existing_doc.session_name,
-                ),
+                )
+                + _ledger_dedup_suffix(existing_doc),
                 existing_doc,
             )
 
     # First document seen per dedup key, so exact duplicates within a single
     # inference call collapse to one document. A collapsed duplicate's
     # citations fold into the first one, and into its pending row if any.
-    first_in_batch: dict[tuple[str, str, str | None], schemas.DocumentCreate] = {}
-    pending_by_key: dict[tuple[str, str, str | None], models.Document] = {}
+    first_in_batch: dict[tuple[Any, ...], schemas.DocumentCreate] = {}
+    pending_by_key: dict[tuple[Any, ...], models.Document] = {}
     # Existing row id -> the incoming document replacing it, by its dedup key.
-    replaced_by: dict[
-        str, tuple[schemas.DocumentCreate, tuple[str, str, str | None]]
-    ] = {}
+    replaced_by: dict[str, tuple[schemas.DocumentCreate, tuple[Any, ...]]] = {}
     row_ops: list[_DocumentRowOp] = []
     pending_times_derived: dict[str, int] = {}
 
@@ -874,13 +1018,17 @@ async def create_documents(
                 )
                 continue
 
-            dedup_key = _dedup_key(doc.content, doc.level, doc.session_name)
+            dedup_key = _dedup_key(
+                doc.content, doc.level, doc.session_name
+            ) + _ledger_dedup_suffix(doc)
 
             # Exact-match dedup, always on:
             # 1) collapse exact duplicates within this batch (drop silently).
             first_doc = first_in_batch.get(dedup_key)
             if first_doc is not None:
                 exact_dup_in_batch_count += 1
+                collapsed[id(doc)] = id(first_doc)
+                outcomes[id(doc)] = "exact_duplicate_in_batch"
                 first_doc.source_message_ids = _merge_citations(
                     first_doc.source_message_ids, doc.source_message_ids
                 )
@@ -912,6 +1060,8 @@ async def create_documents(
                         fallback_document=doc,
                     )
                 )
+                candidate_targets[id(doc)] = existing_match
+                outcomes[id(doc)] = "exact_duplicate_existing"
                 exact_dup_existing_count += 1
                 continue
 
@@ -956,6 +1106,8 @@ async def create_documents(
                             fallback_document=doc,
                         )
                     )
+                    candidate_targets[id(doc)] = existing_dup
+                    outcomes[id(doc)] = "semantic_duplicate_rejected"
                     semantic_dup_rejected_count += 1
                     continue
 
@@ -965,6 +1117,8 @@ async def create_documents(
             honcho_documents.append(new_doc)
             accepted_documents.append(doc)
             pending_by_key[dedup_key] = new_doc
+            candidate_targets[id(doc)] = new_doc
+            created_sources[id(new_doc)] = id(doc)
             if doc.embedding:
                 docs_with_embeddings.append((new_doc, doc.embedding))
 
@@ -1005,6 +1159,7 @@ async def create_documents(
             )
 
     replaced_rows: list[models.Document] = []
+    reinforced_rows: list[models.Document] = []
     try:
         fallback_docs = await _apply_document_row_updates(
             db,
@@ -1013,6 +1168,7 @@ async def create_documents(
             observer=observer,
             observed=observed,
             replaced_out=replaced_rows,
+            reinforced_out=reinforced_rows,
         )
         for fallback_doc in fallback_docs:
             new_doc = _document_model_from_create(
@@ -1023,8 +1179,21 @@ async def create_documents(
             )
             honcho_documents.append(new_doc)
             accepted_documents.append(fallback_doc)
+            candidate_targets[id(fallback_doc)] = new_doc
+            created_sources[id(new_doc)] = id(fallback_doc)
             if fallback_doc.embedding:
                 docs_with_embeddings.append((new_doc, fallback_doc.embedding))
+        creation_snapshots = {
+            row_id: snapshots[input_id]
+            for row_id, input_id in created_sources.items()
+            if input_id in snapshots
+        }
+        await conclusion_ledger.annotate_new_documents(
+            db,
+            workspace_name,
+            honcho_documents,
+            candidates=creation_snapshots,
+        )
         db.add_all(honcho_documents)
         if history is not None:
             await _record_created_history(
@@ -1042,6 +1211,37 @@ async def create_documents(
         # Flushed here so an integrity or deadlock error surfaces from this
         # function, not from the caller's commit.
         await db.flush()
+        if conclusion_ledger.ledger_enabled():
+            # After the flush: revisions need the new rows' ids.
+            replacements = {
+                old.id: pending_by_key.get(replaced_by[old.id][1])
+                for old in replaced_rows
+                if old.id in replaced_by
+            }
+            discarded = []
+            accepted_inputs = set(created_sources.values())
+            for input_id, snapshot in snapshots.items():
+                if input_id in accepted_inputs:
+                    continue
+                target = candidate_targets.get(collapsed.get(input_id, input_id))
+                if target is None:
+                    continue  # validation or construction failure, not a deduplication
+                target = replacements.get(target.id) or target
+                discarded.append(
+                    (target, snapshot, outcomes.get(input_id, "duplicate"))
+                )
+            await conclusion_ledger.record_created(
+                db,
+                honcho_documents,
+                candidates=creation_snapshots,
+                discarded=discarded,
+                replaced=replaced_rows,
+                replaced_by={
+                    old_id: pending_by_key.get(key)
+                    for old_id, (_, key) in replaced_by.items()
+                },
+            )
+            await db.flush()
 
     except IntegrityError as e:
         await db.rollback()
@@ -1267,10 +1467,38 @@ async def delete_documents(
             models.Document.level,
             models.Document.content,
             models.Document.session_name,
+            models.Document.assertion_basis,
+            models.Document.temporal_class,
+            models.Document.validity,
+            models.Document.valid_from,
+            models.Document.valid_until,
+            models.Document.times_derived,
         )
     )
     result = await db.execute(stmt)
     rows = result.all()
+    await conclusion_ledger.record_removed_rows(
+        db,
+        workspace_name,
+        observer=observer,
+        observed=observed,
+        rows=[
+            conclusion_ledger.RemovedRow(
+                id=row.id,
+                level=row.level,
+                content=row.content,
+                session_name=row.session_name,
+                assertion_basis=row.assertion_basis,
+                temporal_class=row.temporal_class,
+                validity=row.validity,
+                valid_from=row.valid_from,
+                valid_until=row.valid_until,
+                times_derived=row.times_derived,
+            )
+            for row in rows
+        ],
+        reason="dreamer" if history is not None else "agent_tool",
+    )
     if history is not None:
         await record_removed(
             db,
@@ -1324,6 +1552,11 @@ async def delete_document_by_id(
     result = cast(CursorResult[Any], await db.execute(update_stmt))
     # After the document, the order a dream takes them in when it removes one.
     erased = await erase_conclusion_history(db, workspace_name, document_id)
+    # A user-requested deletion also erases the conclusion ledger's revisions,
+    # with the flag on or off: rows written while it was on stay erasable.
+    erased += await conclusion_ledger.erase_conclusion_revisions(
+        db, workspace_name, document_id
+    )
 
     if result.rowcount == 0 and erased == 0:
         raise ResourceNotFoundException(
@@ -1429,6 +1662,14 @@ async def create_observations(
     )
 
     for obs, embedding in zip(observations, embeddings, strict=True):
+        # Initialize both link collections. The conclusion ledger reads
+        # `doc.source_ids` / `doc.source_message_ids` right after the insert;
+        # an uninitialized relationship would be loaded lazily there, and a
+        # lazy load outside a greenlet context raises MissingGreenlet.
+        link_kwargs: dict[str, Any] = {
+            "source_links": build_source_links(None, workspace_name),
+            "source_message_links": build_source_message_links(None, workspace_name),
+        }
         if store_embeddings_in_postgres:
             doc = models.Document(
                 workspace_name=workspace_name,
@@ -1437,9 +1678,12 @@ async def create_observations(
                 content=obs.content,
                 level="explicit",  # Manually created observations are always explicit
                 times_derived=1,
-                internal_metadata={},  # No message_ids since not derived from messages
+                internal_metadata={"temporal": obs.temporal.model_dump(mode="json")}
+                if obs.temporal is not None
+                else {},
                 session_name=obs.session_id,
                 embedding=embedding,
+                **link_kwargs,
             )
         else:
             doc = models.Document(
@@ -1449,8 +1693,11 @@ async def create_observations(
                 content=obs.content,
                 level="explicit",  # Manually created observations are always explicit
                 times_derived=1,
-                internal_metadata={},  # No message_ids since not derived from messages
+                internal_metadata={"temporal": obs.temporal.model_dump(mode="json")}
+                if obs.temporal is not None
+                else {},
                 session_name=obs.session_id,
+                **link_kwargs,
             )
         doc.sync_state = "pending"
         honcho_documents.append(doc)
@@ -1462,8 +1709,15 @@ async def create_observations(
         collection_embeddings[collection_key].append((doc, embedding))
 
     try:
-        db.add_all(honcho_documents)
-        await record_explicit_documents(db, honcho_documents)
+        with derivation_scope(DerivationRecord(producer="api")):
+            await conclusion_ledger.annotate_new_documents(
+                db, workspace_name, honcho_documents
+            )
+            db.add_all(honcho_documents)
+            await record_explicit_documents(db, honcho_documents)
+            if conclusion_ledger.ledger_enabled():
+                await db.flush()
+                await conclusion_ledger.record_created(db, honcho_documents)
         await db.commit()
         # Refresh all documents to get generated IDs and timestamps
         for doc in honcho_documents:
@@ -1582,7 +1836,7 @@ def _document_model_from_create(
     observer: str,
     observed: str,
 ) -> models.Document:
-    metadata_dict = doc.metadata.model_dump(exclude_none=True)
+    metadata_dict = doc.metadata.model_dump(mode="json", exclude_none=True)
     store_embeddings_in_postgres = (
         settings.VECTOR_STORE.TYPE == "pgvector" or not settings.VECTOR_STORE.MIGRATED
     )
@@ -1630,10 +1884,12 @@ async def _apply_document_row_updates(
     observer: str,
     observed: str,
     replaced_out: list[models.Document] | None = None,
+    reinforced_out: list[models.Document] | None = None,
 ) -> list[schemas.DocumentCreate]:
     """Lock target rows by id, apply ops, return fallbacks for vanished targets.
 
-    Rows a `replace` op soft-deletes are appended to ``replaced_out``.
+    Rows a `replace` op soft-deletes are appended to ``replaced_out``, and rows
+    a `reinforce` op raised to ``reinforced_out``.
     """
     if not ops:
         return []
@@ -1704,6 +1960,8 @@ async def _apply_document_row_updates(
             # An earlier op in this batch replaced this row.
             continue
         row.times_derived = max(row.times_derived + 1, op.incoming_times_derived)
+        if reinforced_out is not None:
+            reinforced_out.append(row)
         if op.fallback_document is not None:
             _append_citations(
                 row,
@@ -1845,8 +2103,15 @@ async def _pgvector_dup_candidates(
             .where(models.Document.embedding.isnot(None))
             .where(models.Document.deleted_at.is_(None))
             .where(distance <= _SEMANTIC_DUP_MAX_DISTANCE)
+            .where(*_dedup_current_filters())
         )
         leg = apply_filter(leg, models.Document, filters)
+        temporal_key = _temporal_dedup_key(doc)
+        if temporal_key is not None:
+            # Before the LIMIT: the nearest neighbour overall may be a
+            # different claim, and would hide the nearest one that is the
+            # same claim.
+            leg = leg.where(_temporal_key_clause(temporal_key))
         nearest = leg.order_by(distance).limit(_SEMANTIC_DUP_TOP_K).subquery()
         legs.append(
             cast(
@@ -1883,6 +2148,8 @@ async def _fetch_dup_candidates_by_id(
         observer=observer,
         observed=observed,
         document_ids=unique_ids,
+        include_non_current=True,
+        for_dedup=True,
     )
     return {document.id: document for document in documents}
 
@@ -1907,6 +2174,8 @@ def _resolve_semantic_dup(
         if existing_doc is None:
             continue
         if not _matches_semantic_dup_filters(existing_doc, filters):
+            continue
+        if _ledger_dedup_suffix(doc) != _ledger_dedup_suffix(existing_doc):
             continue
         return _score_semantic_dup(doc, existing_doc), existing_doc
 
@@ -1935,11 +2204,15 @@ async def _semantic_dup_decision(
             observed=observed,
             document_ids=candidate_document_ids,
             filters=filters,
+            for_dedup=True,
         )
     elif _uses_pgvector():
         if not doc.embedding:
             # Match external-store path: never embed under an open session.
             return SemanticRejectionResult.NOT_DUPLICATE, None
+        # Apply the same dedup-only validity and world-time predicates used
+        # by the batched pgvector path. Filtering AFTER top_k would allow a
+        # historical nearest neighbor to hide an applicable second result.
         similar_docs = await query_documents(
             db=db,
             workspace_name=workspace_name,
@@ -1950,6 +2223,9 @@ async def _semantic_dup_decision(
             max_distance=_SEMANTIC_DUP_MAX_DISTANCE,
             top_k=_SEMANTIC_DUP_TOP_K,
             embedding=doc.embedding,
+            include_non_current=True,
+            for_dedup=True,
+            temporal_key=_temporal_dedup_key(doc),
         )
     else:
         return SemanticRejectionResult.NOT_DUPLICATE, None
@@ -1958,6 +2234,8 @@ async def _semantic_dup_decision(
         return SemanticRejectionResult.NOT_DUPLICATE, None
 
     existing_doc = similar_docs[0]
+    if _ledger_dedup_suffix(doc) != _ledger_dedup_suffix(existing_doc):
+        return SemanticRejectionResult.NOT_DUPLICATE, None
     return _score_semantic_dup(doc, existing_doc), existing_doc
 
 

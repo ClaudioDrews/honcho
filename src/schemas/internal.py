@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from src.schemas.api import MessageCreate
 from src.schemas.configuration import SessionPeerConfig
+from src.utils.interpretation import TemporalValidity
 from src.utils.sanitization import NulStripped
 from src.utils.types import DocumentLevel
 
@@ -35,6 +36,7 @@ class DocumentBase(BaseModel):
 
 
 class DocumentMetadata(BaseModel):
+    temporal: TemporalValidity | None = None
     message_ids: list[int] = Field(
         description="The ID range(s) of the messages that this document was derived from. Acts as a link to the primary source of the document. Note that as a document gets deduplicated, additional ranges will be added, because the same document could be derived from completely separate message ranges."
     )
@@ -95,6 +97,7 @@ class ObservationInput(BaseModel):
     """Validated observation input from LLM tool calls."""
 
     content: Annotated[str, Field(min_length=1), NulStripped]
+    temporal: TemporalValidity | None = None
     level: DocumentLevel = "explicit"
     source_ids: list[str] | None = None
     premises: list[str] | None = None

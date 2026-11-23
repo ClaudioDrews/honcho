@@ -334,3 +334,24 @@ CHROMA_CLIENT_MODE = "http"
 # CHROMA_TENANT = "your-tenant-id"
 # CHROMA_DATABASE = "your-database"
 RECONCILIATION_INTERVAL_SECONDS = 300
+
+# Conclusion ledger: permanent history of how conclusions were interpreted,
+# assertion basis (declared vs the model's reading), validity, and the model and
+# prompt that produced each conclusion. Off by default.
+[conclusion_ledger]
+ENABLED = false
+# These switches are intentionally INDEPENDENT. Enabling history alone only
+# records observations; it must not change what Honcho deduplicates, retrieves,
+# or asks a model to produce.
+TEMPORAL_EXTRACTION_ENABLED = false
+TEMPORAL_DEDUP_ENABLED = false
+RETRIEVAL_FILTER_ENABLED = false
+CONTRADICTION_TOOL_ENABLED = false
+AUTO_RESOLVE_CONTRADICTIONS = false
+MARK_SUPERSEDED_HISTORICAL = false
+VERBATIM_MIN_CHARS = 12
+# Legacy option retained for configuration compatibility; fuzzy matches never establish a declaration.
+NEAR_VERBATIM_MIN_RATIO = 0.9
+# "unknown" or "most_recent"
+CONTRADICTION_RESOLUTION = "unknown"
+RETRIEVAL_EXCLUDE = ["historical", "incompatible"]

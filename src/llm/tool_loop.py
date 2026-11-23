@@ -31,6 +31,7 @@ from pydantic import BaseModel
 from tenacity import RetryCallState, retry, stop_after_attempt, wait_exponential
 
 from src.exceptions import ValidationException
+from src.utils.derivation import model_used_scope
 from src.utils.types import (
     get_last_tool_error,
     get_last_tool_metadata,
@@ -366,12 +367,30 @@ async def _execute_tool_calls(
     tool_calls: list[dict[str, Any]],
     tool_executor: Callable[[str, dict[str, Any]], Any],
     all_tool_calls: list[dict[str, Any]],
+    answering_model: str | None = None,
+    ledger_call: dict[str, Any] | None = None,
 ) -> tuple[list[ToolMessage], set[str]]:
     """Run one response's tool calls in order.
 
     Successful calls are appended to `all_tool_calls`. Returns the results to
     send back to the model and the names of the tools that succeeded.
+    `answering_model` (the model that asked for the calls) is recorded on any
+    conclusion the tools write (src.utils.derivation.model_used_scope).
     """
+    with model_used_scope(
+        (ledger_call or {}).get("reported_model") or answering_model,
+        **(ledger_call or {}),
+    ):
+        return await _execute_tool_calls_inner(
+            tool_calls, tool_executor, all_tool_calls
+        )
+
+
+async def _execute_tool_calls_inner(
+    tool_calls: list[dict[str, Any]],
+    tool_executor: Callable[[str, dict[str, Any]], Any],
+    all_tool_calls: list[dict[str, Any]],
+) -> tuple[list[ToolMessage], set[str]]:
     tool_results: list[ToolMessage] = []
     succeeded_tools: set[str] = set()
     for seq, tool_call in enumerate(tool_calls):
@@ -391,7 +410,8 @@ async def _execute_tool_calls(
         set_last_tool_error(False)
 
         try:
-            tool_result = await tool_executor(tool_name, tool_input)
+            with model_used_scope(None, tool_call_id=tool_id or None):
+                tool_result = await tool_executor(tool_name, tool_input)
             # Stash ToolResult.metadata on all_tool_calls so
             # specialist rollups can read created/deleted observation
             # counts without round-tripping through the event store.
@@ -736,7 +756,11 @@ async def execute_tool_loop(
             set_current_iteration(iteration + 1)
 
             tool_results, succeeded_tools = await _execute_tool_calls(
-                response.tool_calls_made, tool_executor, all_tool_calls
+                response.tool_calls_made,
+                tool_executor,
+                all_tool_calls,
+                answering_model=response.model,
+                ledger_call=response.ledger_call,
             )
 
             conversation_messages.extend(tool_results)
@@ -917,6 +941,8 @@ async def execute_tool_loop(
                 [tc for tc in final_response.tool_calls_made if tc["name"] in allowed],
                 tool_executor,
                 all_tool_calls,
+                answering_model=final_response.model,
+                ledger_call=final_response.ledger_call,
             )
     finally:
         if synthesis_step is not None:

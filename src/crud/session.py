@@ -41,6 +41,7 @@ from src.cache.client import (
     safe_cache_set,
 )
 from src.config import settings
+from src.crud.conclusion_ledger import delete_session_revisions
 from src.crud.deriver import (
     active_queue_session_match,
     delete_queue_items_and_claims,
@@ -860,6 +861,7 @@ async def delete_session(
         # After the messages and before the session row, the order workspace
         # deletion takes them in.
         await delete_session_history(db, workspace_name, session_name)
+        await delete_session_revisions(db, workspace_name, session_name)
 
         # Finally, delete the session itself
         await db.delete(honcho_session)

@@ -845,6 +845,31 @@ class Document(Base, TenantPartitioned):
     level: Mapped[DocumentLevel] = mapped_column(
         TEXT, nullable=False, server_default="explicit"
     )
+    # Conclusion ledger (CONCLUSION_LEDGER_ENABLED). Assertion basis: what the
+    # content rests on (src.utils.derivation); NULL for rows written with the
+    # ledger off. Validity: the conclusion's standing for the present. Their
+    # values are checked in the application (src.utils.derivation), not by a
+    # CHECK constraint: adding one to documents would scan the table under an
+    # ACCESS EXCLUSIVE lock.
+    temporal_class: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    assertion_basis: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    validity: Mapped[str] = mapped_column(
+        TEXT, nullable=False, server_default="applicable", default="applicable"
+    )
+    # The span(s) of the cited messages an explicit conclusion rests on:
+    # [{message_id, start, end, sha256, match, score}] (src.utils.derivation).
+    declared_spans: Mapped[list[dict[str, Any]] | None] = mapped_column(
+        JSONB, nullable=True
+    )
+    # When the conclusion became and stopped being true of the observed peer,
+    # as far as the ledger knows. Neither bound is inferred from record time.
+    # NULL bounds mean unknown/open; valid_until is exclusive.
+    valid_from: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    valid_until: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     times_derived: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default=text("1")
     )
@@ -1573,6 +1598,107 @@ class DreamRunChange(Base, TenantPartitioned):
         ),
         CheckConstraint(
             "kind IN ('created', 'removed', 'peer_card')", name="kind_valid"
+        ),
+        {"postgresql_partition_by": "HASH (tenant_id)"},
+    )
+
+
+@final
+class ConclusionRevision(Base, TenantPartitioned):
+    """One entry in the permanent history of a conclusion's interpretation.
+
+    Append-only and written in the transaction that makes the change, by every
+    writer (deriver, dreamer, API), when CONCLUSION_LEDGER_ENABLED is on. Each
+    row copies the conclusion as it read at that moment, so the history
+    survives the hard delete of the document. `kind`: `created`, `reinforced`
+    (derived again: an exact or semantic duplicate raised `times_derived`),
+    `superseded` (replaced by `superseded_by`), `removed`, `revalidated`
+    (validity or validity window changed).
+
+    There is no foreign key to documents on purpose. Deleting a conclusion
+    through the API, its session or its workspace deletes its revisions
+    explicitly: the ledger keeps what the system revised, never what the user
+    asked to forget.
+    """
+
+    __tablename__: str = "conclusion_revisions"
+
+    tenant_id: Mapped[str] = mapped_column(
+        TEXT,
+        ForeignKey("tenants.tenant_id"),
+        nullable=False,
+        default=_default_tenant_id,
+    )
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), autoincrement=True)
+    workspace_name: Mapped[str] = mapped_column(TEXT, nullable=False)
+    observer: Mapped[str] = mapped_column(TEXT, nullable=False)
+    observed: Mapped[str] = mapped_column(TEXT, nullable=False)
+    session_name: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    conclusion_id: Mapped[str] = mapped_column(TEXT, nullable=False)
+    kind: Mapped[str] = mapped_column(TEXT, nullable=False)
+    level: Mapped[DocumentLevel | None] = mapped_column(TEXT, nullable=True)
+    content: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    temporal_class: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    assertion_basis: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    validity: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    previous_validity: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    superseded_by: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    source_ids: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    source_message_ids: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    declared_spans: Mapped[list[dict[str, Any]] | None] = mapped_column(
+        JSONB, nullable=True
+    )
+    valid_from: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    valid_until: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    times_derived: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Who wrote this revision and how: producer, model, fallback_model,
+    # prompt_version, run_id (src.utils.derivation.DerivationRecord).
+    derivation: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    reason: Mapped[str | None] = mapped_column(TEXT, nullable=True)
+    candidate: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        PrimaryKeyConstraint("tenant_id", "id"),
+        ForeignKeyConstraint(
+            ["workspace_name", "tenant_id"],
+            ["workspaces.name", "workspaces.tenant_id"],
+            name="fk_conclusion_revisions_ws_tenant_workspaces",
+        ),
+        # A conclusion's history, in order.
+        Index(
+            "ix_conclusion_revisions_conclusion",
+            "tenant_id",
+            "workspace_name",
+            "conclusion_id",
+            "id",
+        ),
+        # A representation's history, newest first.
+        Index(
+            "ix_conclusion_revisions_collection_created",
+            "tenant_id",
+            "workspace_name",
+            "observer",
+            "observed",
+            "created_at",
+        ),
+        # Session deletion removes the revisions that session produced.
+        Index(
+            "ix_conclusion_revisions_session",
+            "tenant_id",
+            "workspace_name",
+            "session_name",
+            postgresql_where=text("session_name IS NOT NULL"),
+        ),
+        CheckConstraint(
+            "kind IN ('created', 'reinforced', 'superseded', 'removed', 'revalidated')",
+            name="kind_valid",
         ),
         {"postgresql_partition_by": "HASH (tenant_id)"},
     )

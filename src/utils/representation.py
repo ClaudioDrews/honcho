@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from src import models
 from src.utils.formatting import parse_datetime_iso
+from src.utils.interpretation import TemporalValidity
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +106,14 @@ class ExplicitObservationBase(BaseModel):
     content: str = Field(description="The explicit observation")
 
 
+class LedgerExplicitObservationBase(ExplicitObservationBase):
+    temporal: TemporalValidity | None = Field(
+        default=None, description="World-time class and supported validity bounds."
+    )
+
+
 class DeductiveObservationBase(BaseModel):
+    temporal: TemporalValidity | None = None
     source_ids: list[str] = Field(
         description="Document IDs of premise observations for tree traversal",
         default_factory=list,
@@ -206,8 +214,14 @@ class PromptRepresentation(BaseModel):
         return v
 
 
+class LedgerPromptRepresentation(PromptRepresentation):
+    explicit: list[LedgerExplicitObservationBase] = Field(default_factory=list)  # pyright: ignore[reportIncompatibleVariableOverride]
+
+
 class ExplicitObservation(ExplicitObservationBase, ObservationMetadata):
     """Explicit observation with content and metadata."""
+
+    temporal: TemporalValidity | None = None
 
     def __str__(self) -> str:
         return f"[{_strip_microseconds_and_timezone(self.created_at)}] {self.content}"
@@ -762,6 +776,9 @@ class Representation(BaseModel):
             explicit_observations.append(
                 ExplicitObservation(
                     content=explicit.content,
+                    temporal=explicit.temporal
+                    if isinstance(explicit, LedgerExplicitObservationBase)
+                    else None,
                     created_at=created_at,
                     message_ids=message_ids,
                     source_message_ids=list(dict.fromkeys(source_message_ids)),

@@ -94,6 +94,7 @@ class _CopySpec:
     source_message_ids: list[str] | None
     session_name: str
     restore_document_id: str | None = None
+    ledger_columns: dict[str, Any] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +194,12 @@ async def _run_backfill(
                     models.Document.times_derived,
                     models.Document.internal_metadata,
                     models.Document.session_name,
+                    models.Document.temporal_class,
+                    models.Document.assertion_basis,
+                    models.Document.declared_spans,
+                    models.Document.validity,
+                    models.Document.valid_from,
+                    models.Document.valid_until,
                     # source_ids falls back to this column for undrained rows.
                     models.Document.legacy_source_ids,
                     models.Document.deleted_at,
@@ -269,6 +276,18 @@ async def _run_backfill(
                     source_message_ids=source.source_message_ids,
                     session_name=session_name,
                     restore_document_id=soft_deleted_copies.get(key),
+                    ledger_columns=(
+                        {
+                            "temporal_class": source.temporal_class,
+                            "assertion_basis": source.assertion_basis,
+                            "declared_spans": source.declared_spans,
+                            "validity": source.validity,
+                            "valid_from": source.valid_from,
+                            "valid_until": source.valid_until,
+                        }
+                        if settings.CONCLUSION_LEDGER.ENABLED
+                        else None
+                    ),
                 )
             )
 
@@ -373,6 +392,18 @@ async def _copy_chunk(
         for spec in plans:
             if spec.restore_document_id is not None:
                 restore_ids.append(spec.restore_document_id)
+                if spec.ledger_columns is not None:
+                    await db.execute(
+                        update(models.Document)
+                        .where(models.Document.id == spec.restore_document_id)
+                        .values(
+                            **spec.ledger_columns,
+                            internal_metadata={
+                                **spec.internal_metadata,
+                                COPIED_FROM_KEY: spec.source_id,
+                            },
+                        )
+                    )
                 restored_citations.extend(
                     {
                         "conclusion_id": spec.restore_document_id,
@@ -400,6 +431,7 @@ async def _copy_chunk(
                 source_ids=spec.source_ids,
                 source_message_ids=spec.source_message_ids,
                 embedding=spec.embedding if store_in_postgres else None,
+                **(spec.ledger_columns or {}),
             )
             row.sync_state = "pending"
             new_rows.append(row)

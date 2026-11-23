@@ -92,6 +92,7 @@ _RLS_REQUIRED_TABLES: tuple[str, ...] = (
     "webhook_endpoints",
     "dream_runs",
     "dream_run_changes",
+    "conclusion_revisions",
     "ingest_records",
     "ingest_session_bindings",
     "ingest_peer_bindings",

@@ -24,7 +24,16 @@ from src.telemetry.prometheus.metrics import (
 )
 from src.telemetry.sentry import with_sentry_transaction
 from src.utils.config_helpers import get_configuration
-from src.utils.representation import PromptRepresentation, Representation
+from src.utils.derivation import (
+    DerivationRecord,
+    derivation_scope,
+    prompt_scaffold_fingerprint,
+)
+from src.utils.representation import (
+    LedgerPromptRepresentation,
+    PromptRepresentation,
+    Representation,
+)
 from src.utils.retryable_errors import is_retryable_error
 from src.utils.tokens import estimate_tokens, track_deriver_input_tokens
 
@@ -189,7 +198,12 @@ async def process_representation_tasks_batch(
         model_config=model_config,
         prompt=prompt,
         max_tokens=max_tokens,
-        response_model=PromptRepresentation,
+        response_model=(
+            LedgerPromptRepresentation
+            if settings.CONCLUSION_LEDGER.ENABLED
+            and settings.CONCLUSION_LEDGER.TEMPORAL_EXTRACTION_ENABLED
+            else PromptRepresentation
+        ),
         json_mode=True,
         max_input_tokens=settings.DERIVER.MAX_INPUT_TOKENS,
         enable_retry=True,
@@ -241,6 +255,22 @@ async def process_representation_tasks_batch(
         latest_message.created_at,
     )
 
+    # Conclusion ledger: who derived these and how. The prompt fingerprint
+    # covers the scaffold (placeholders for the per-call parts) and the custom
+    # instructions, so it changes only when the prompt version does. The
+    # configured model and fallback are recorded with the one that answered.
+    derivation = DerivationRecord(
+        producer="deriver",
+        model=model_config.model,
+        fallback_model=model_config.fallback.model if model_config.fallback else None,
+        model_used=response.ledger_call.get("reported_model") or response.model,
+        prompt_version=prompt_scaffold_fingerprint(
+            minimal_deriver_prompt, custom_instructions
+        ),
+        run_id=trace_id,
+        **response.ledger_call,
+    )
+
     agg_representation_result = crud.CreateDocumentsResult()
     successful_observer_count = 0
     save_errors: list[tuple[str, Exception]] = []
@@ -265,15 +295,16 @@ async def process_representation_tasks_batch(
             )
 
             try:
-                representation_result = (
-                    await representation_manager.save_representation(
-                        observations,
-                        message_ids,
-                        latest_message.session_name,
-                        latest_message.created_at,
-                        message_level_configuration,
+                with derivation_scope(derivation):
+                    representation_result = (
+                        await representation_manager.save_representation(
+                            observations,
+                            message_ids,
+                            latest_message.session_name,
+                            latest_message.created_at,
+                            message_level_configuration,
+                        )
                     )
-                )
                 agg_representation_result.exact_dup_existing_count += (
                     representation_result.exact_dup_existing_count
                 )

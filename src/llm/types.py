@@ -176,6 +176,11 @@ class HonchoLLMCallResponse(BaseModel, Generic[T]):
     hit_iteration_limit: bool = False
     # The assistant turn this response carries, ready to append to a history.
     message: AIMessage | None = None
+    # The model that produced this response: the primary or, on the final
+    # retry attempt, the fallback. Set by the executor on every call.
+    model: str | None = None
+    ledger_call: dict[str, Any] = Field(default_factory=dict)
+    transport: str | None = None
 
 
 # Finish reasons arrive provider-native (never normalized by the executor), so

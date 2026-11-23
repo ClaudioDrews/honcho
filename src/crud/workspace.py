@@ -22,6 +22,7 @@ from src.cache.client import (
     safe_cache_set,
 )
 from src.config import settings
+from src.crud.conclusion_ledger import delete_workspace_revisions
 from src.crud.deriver import (
     active_queue_session_match,
     delete_queue_items_and_claims,
@@ -592,6 +593,7 @@ async def delete_workspace(
         # changes before its run. Before the sessions: session deletion takes
         # its history before its session row.
         await delete_workspace_history(db, workspace_name)
+        await delete_workspace_revisions(db, workspace_name)
         await db.execute(
             delete(models.Session).where(
                 models.Session.workspace_name == workspace_name

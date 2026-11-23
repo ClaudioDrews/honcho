@@ -47,9 +47,16 @@ from src.utils.agent_tools import (
     CARD_REFRESH_SPECIALIST_TOOLS,
     DEDUCTION_SPECIALIST_TOOLS,
     INDUCTION_SPECIALIST_TOOLS,
+    TOOLS,
     ToolContext,
     create_tool_executor,
     get_tool_handler,
+    with_ledger_temporal_tools,
+)
+from src.utils.derivation import (
+    DerivationRecord,
+    derivation_scope,
+    prompt_scaffold_fingerprint,
 )
 from src.utils.formatting import custom_instructions_section
 from src.utils.memory_brief import format_memory_counts, memory_layout_section
@@ -612,42 +619,63 @@ If you update it, send the full deduplicated list and remove stale entries.
             # closed CallPurpose enum slugs without importing the enum here.
             call_purpose_slug = f"dream.{self.name}"
 
-            # Run the agent loop
-            response = await honcho_llm_call(
-                model_config=model_config,
-                prompt="",  # Ignored since we pass messages
-                max_tokens=effective_max_tokens,
-                tools=tools,
-                tool_choice=None,
-                tool_executor=tool_executor,
-                max_tool_iterations=max_iterations,
-                budget_line=dream_budget_line(window) if budget_enabled else None,
-                final_call_tools=(
-                    [t for t in tools if t["name"] not in SEARCH_TOOL_NAMES]
-                    if budget_enabled
-                    else None
+            # Conclusion ledger: conclusions this run writes record who wrote
+            # them. The fingerprint renders the system prompt with a placeholder
+            # for the peer, so it changes with the prompt version, not the peer.
+            derivation = DerivationRecord(
+                producer=f"dreamer.{self.name}",
+                model=model_config.model,
+                fallback_model=(
+                    model_config.fallback.model if model_config.fallback else None
                 ),
-                messages=messages,
-                telemetry=LLMTelemetryContext(
-                    workspace_name=workspace_name,
-                    call_purpose=call_purpose_slug,
-                    parent_category="dream",
-                    agent_type=self.name,
-                    run_id=run_id,
-                    # Root span per specialist run (distinct span_id, see above).
-                    # parent_span_id stays None for now; wiring specialists as
-                    # children of a dream-level trace is forking (out of scope).
-                    trace_id=run_id,
-                    span_id=span_id,
-                    observer=observer,
-                    observed=observed,
-                    track_name=f"Dreamer/{self.name}",
-                    observers=[observer],
-                    session_id=session_id,
-                    queue_item_ids=[queue_item_id] if queue_item_id is not None else [],
-                    custom_instructions=injected_instructions.strip() or None,
+                prompt_version=prompt_scaffold_fingerprint(
+                    self.build_system_prompt,
+                    f"peer_card={peer_card_enabled};brief={brief_enabled}"
+                    f";budget={budget_enabled};notes={notes_enabled}",
+                    injected_instructions,
                 ),
+                run_id=run_id,
             )
+
+            # Run the agent loop
+            with derivation_scope(derivation):
+                response = await honcho_llm_call(
+                    model_config=model_config,
+                    prompt="",  # Ignored since we pass messages
+                    max_tokens=effective_max_tokens,
+                    tools=tools,
+                    tool_choice=None,
+                    tool_executor=tool_executor,
+                    max_tool_iterations=max_iterations,
+                    budget_line=dream_budget_line(window) if budget_enabled else None,
+                    final_call_tools=(
+                        [t for t in tools if t["name"] not in SEARCH_TOOL_NAMES]
+                        if budget_enabled
+                        else None
+                    ),
+                    messages=messages,
+                    telemetry=LLMTelemetryContext(
+                        workspace_name=workspace_name,
+                        call_purpose=call_purpose_slug,
+                        parent_category="dream",
+                        agent_type=self.name,
+                        run_id=run_id,
+                        # Root span per specialist run (distinct span_id, see above).
+                        # parent_span_id stays None for now; wiring specialists as
+                        # children of a dream-level trace is forking (out of scope).
+                        trace_id=run_id,
+                        span_id=span_id,
+                        observer=observer,
+                        observed=observed,
+                        track_name=f"Dreamer/{self.name}",
+                        observers=[observer],
+                        session_id=session_id,
+                        queue_item_ids=[queue_item_id]
+                        if queue_item_id is not None
+                        else [],
+                        custom_instructions=injected_instructions.strip() or None,
+                    ),
+                )
 
             # Log metrics
             duration_ms = (time.perf_counter() - start_time) * 1000
@@ -851,13 +879,17 @@ class DeductionSpecialist(BaseSpecialist):
     peer_card_update_instruction: str = "Update this with `update_peer_card` only for stable identity markers. See the PEER CARD section in the system prompt for the allowed entry kinds and rules."
 
     def get_tools(self, *, peer_card_enabled: bool = True) -> list[dict[str, Any]]:
-        if peer_card_enabled:
-            return DEDUCTION_SPECIALIST_TOOLS
-        return [
-            t
-            for t in DEDUCTION_SPECIALIST_TOOLS
-            if t["name"] not in PEER_CARD_TOOL_NAMES
-        ]
+        tools = list(with_ledger_temporal_tools(DEDUCTION_SPECIALIST_TOOLS))
+        if (
+            settings.CONCLUSION_LEDGER.ENABLED
+            and settings.CONCLUSION_LEDGER.CONTRADICTION_TOOL_ENABLED
+        ):
+            tools.append(TOOLS["create_observations_contradiction"])
+        return (
+            tools
+            if peer_card_enabled
+            else [t for t in tools if t["name"] not in PEER_CARD_TOOL_NAMES]
+        )
 
     def get_model_config(self) -> ConfiguredModelSettings:
         return _require_specialist_model_config(
@@ -879,6 +911,16 @@ class DeductionSpecialist(BaseSpecialist):
         if peer_card_enabled:
             peer_card_section = PEER_CARD_SYSTEM_SECTION
 
+        contradiction_instruction = (
+            "Use `create_observations_contradiction` with two distinct source IDs; "
+            "do not delete contested claims or choose a winner based on recency alone. "
+            "Distinguish changes over time from incompatible claims at the same time."
+            if (
+                settings.CONCLUSION_LEDGER.ENABLED
+                and settings.CONCLUSION_LEDGER.CONTRADICTION_TOOL_ENABLED
+            )
+            else ""
+        )
         return f"""You are a deductive reasoning agent analyzing observations about the target observee.
 
 ## YOUR JOB
@@ -911,7 +953,8 @@ Extract implicit information:
 
 ### Contradictions
 When statements can't both be true (not just updates), flag them:
-- "I love coffee" vs "I hate coffee" → contradiction observation
+- "I love coffee" vs "I hate coffee" at the same time and context → possible contradiction
+{contradiction_instruction}
 {peer_card_section}
 
 ## CREATING OBSERVATIONS
@@ -1002,7 +1045,7 @@ class InductionSpecialist(BaseSpecialist):
 
     def get_tools(self, *, peer_card_enabled: bool = True) -> list[dict[str, Any]]:
         _ = peer_card_enabled
-        return INDUCTION_SPECIALIST_TOOLS
+        return with_ledger_temporal_tools(INDUCTION_SPECIALIST_TOOLS)
 
     def get_model_config(self) -> ConfiguredModelSettings:
         return _require_specialist_model_config(

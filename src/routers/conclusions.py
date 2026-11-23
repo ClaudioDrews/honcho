@@ -1,14 +1,17 @@
 import logging
+from typing import Any
 
 from fastapi import APIRouter, Body, Depends, Path, Query
 from fastapi_pagination.bases import AbstractParams
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src import crud, schemas
+from src.crud import conclusion_ledger
 from src.dependencies import db, read_db
 from src.exceptions import ResourceNotFoundException, ValidationException
 from src.security import require_auth
 from src.telemetry.events import EmbeddingCallPurpose
+from src.utils.derivation import DerivationRecord, derivation_scope
 from src.utils.pagination import (
     CursorPage,
     Page,
@@ -44,11 +47,12 @@ async def create_conclusions(
 
     Conclusions are logical certainties derived from interactions between Peers. They form the basis of a Peer's Representation.
     """
-    documents = await crud.create_observations(
-        db,
-        observations=body.conclusions,
-        workspace_name=workspace_id,
-    )
+    with derivation_scope(DerivationRecord(producer="api")):
+        documents = await crud.create_observations(
+            db,
+            observations=body.conclusions,
+            workspace_name=workspace_id,
+        )
 
     logger.debug(
         "Created %d conclusions in workspace %s",
@@ -193,3 +197,61 @@ async def delete_conclusion(
     except ValueError as e:
         logger.warning(f"Failed to delete conclusion {conclusion_id}: {str(e)}")
         raise ResourceNotFoundException("Conclusion not found") from e
+
+
+@router.get(
+    "/{conclusion_id}/history",
+    response_model=list[schemas.ConclusionRevision],
+)
+async def get_conclusion_history(
+    workspace_id: str = Path(...),
+    conclusion_id: str = Path(...),
+    db: AsyncSession = read_db,
+) -> list[schemas.ConclusionRevision]:
+    """
+    Get a Conclusion's permanent history from the conclusion ledger.
+
+    Revisions run in order from the conclusion's creation through each
+    conclusion that superseded it. Empty when the ledger was off for every
+    change. Revisions of a conclusion deleted through this API, of its session
+    or of its workspace are deleted with it.
+    """
+    revisions = await conclusion_ledger.get_conclusion_history(
+        db, workspace_id, conclusion_id
+    )
+    return [schemas.ConclusionRevision.model_validate(r) for r in revisions]
+
+
+@router.put(
+    "/{conclusion_id}/validity",
+    response_model=schemas.Conclusion,
+)
+async def set_conclusion_validity(
+    workspace_id: str = Path(...),
+    conclusion_id: str = Path(...),
+    body: schemas.ConclusionValiditySet = Body(...),
+    db: AsyncSession = db,
+) -> schemas.Conclusion:
+    """
+    Set a Conclusion's validity and validity window, and record the change in
+    the conclusion ledger.
+
+    Requires `CONCLUSION_LEDGER_ENABLED`; a 422 otherwise.
+    """
+    with derivation_scope(DerivationRecord(producer="api")):
+        window: dict[str, Any] = {
+            field: getattr(body, field)
+            for field in ("valid_from", "valid_until", "temporal_class")
+            if field in body.model_fields_set
+        }
+        document = await conclusion_ledger.set_conclusion_validity(
+            db,
+            workspace_id,
+            conclusion_id,
+            body.validity,
+            reason=body.reason,
+            **window,
+        )
+    await db.commit()
+    await db.refresh(document)
+    return schemas.Conclusion.model_validate(document)
